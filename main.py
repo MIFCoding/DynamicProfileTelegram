@@ -3,7 +3,6 @@ import asyncio
 import logging
 import io
 import re
-import random
 from datetime import datetime, timezone, timedelta, time
 from typing import Optional, Tuple, Callable, Dict, Any, Awaitable
 from collections import defaultdict
@@ -31,7 +30,7 @@ OPENWEATHER_API_KEY = os.getenv('OPENWEATHERMAP_API_KEY')
 TELEGRAM_API_ID = int(os.getenv("TELEGRAM_API_ID"))
 TELEGRAM_API_HASH = os.getenv("TELEGRAM_API_HASH")
 SESSION_NAME = 'profile_changer'
-DEFAULT_MODE = int(os.getenv("MODE", 1))
+FIXED_INTERVAL = 5  # Фиксированный интервал 5 минут
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,10 +64,10 @@ class SharedData:
         self.profile_text: Optional[str] = None
         self.lat: Optional[float] = None
         self.lon: Optional[float] = None
-        self.mode: int = DEFAULT_MODE
         self.last_flood_wait: Optional[float] = None
         self.flood_wait_until: Optional[datetime] = None
         self.running = True
+        self.last_update_time: Optional[datetime] = None
 
     def is_running(self) -> bool:
         return self.running
@@ -84,14 +83,6 @@ class SharedData:
         async with self.lock:
             return (self.city_name, self.profile_text, self.lat, self.lon)
 
-    async def set_mode(self, mode: int):
-        async with self.lock:
-            self.mode = mode
-
-    async def get_mode(self) -> int:
-        async with self.lock:
-            return self.mode
-
     async def set_flood_wait(self, seconds: float):
         async with self.lock:
             self.last_flood_wait = seconds
@@ -104,6 +95,14 @@ class SharedData:
     async def stop(self):
         async with self.lock:
             self.running = False
+
+    async def update_last_time(self):
+        async with self.lock:
+            self.last_update_time = datetime.now()
+
+    async def get_last_time(self) -> Optional[datetime]:
+        async with self.lock:
+            return self.last_update_time
 
 
 shared_data = SharedData()
@@ -165,12 +164,14 @@ class CleanupMiddleware(BaseMiddleware):
 
         if event.from_user.id == bot.id:
             return await handler(event, data)
-
-        state = data.get('state')
+        
+        state: FSMContext | None = data.get('state')
         current_state = await state.get_state() if state else None
 
-        if event.text and event.text.startswith('/') and current_state is None:
-            message_store.add_message(event.chat.id, event.message_id)
+        if event.text and event.text.startswith('/'):
+            if state:
+                await state.clear()
+                logger.info(f"Состояние FSM сброшено для команды: {event.text}")
 
             message_ids = message_store.get_messages(event.chat.id)
             for msg_id in message_ids:
@@ -178,19 +179,23 @@ class CleanupMiddleware(BaseMiddleware):
                     await bot.delete_message(event.chat.id, msg_id)
                 except Exception as e:
                     logger.error(f"Ошибка удаления сообщения {msg_id}: {e}")
-
             message_store.clear_chat(event.chat.id)
 
-            return await handler(event, data)
-        elif current_state is None:
             try:
                 await event.delete()
             except Exception as e:
-                logger.error(f"Ошибка удаления сообщения: {e}")
-            return
-        else:
+                logger.error(f"Ошибка удаления команды: {e}")
+
+            return await handler(event, data)
+
+        if current_state:
             message_store.add_message(event.chat.id, event.message_id)
             return await handler(event, data)
+
+        try:
+            await event.delete()
+        except Exception as e:
+            logger.error(f"Ошибка удаления сообщения: {e}")
 
 
 dp.message.outer_middleware(AccessMiddleware())
@@ -241,10 +246,14 @@ async def get_weather_data(session: aiohttp.ClientSession, lat: float, lon: floa
 
 @dp.message(Command("set"))
 async def cmd_set(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state:
+        await state.clear()
+        logger.warning(f"Обнаружено активное состояние {current_state} при запуске /set")
+    
     msg = await message.answer("📍 Введите название населенного пункта в России:")
     message_store.add_message(message.chat.id, msg.message_id)
     await state.set_state(CitySelection.choosing_city)
-
 
 @dp.message(CitySelection.choosing_city, F.text)
 async def process_city_name(message: types.Message, state: FSMContext):
@@ -408,14 +417,12 @@ async def cancel_stop(callback: types.CallbackQuery):
 @dp.message(Command("info"))
 async def cmd_info(message: types.Message):
     city_name, profile_text, _, _ = await shared_data.get()
-    mode = await shared_data.get_mode()
+    last_update = await shared_data.get_last_time()
     _, flood_until = await shared_data.get_flood_info()
 
-    mode_text = {
-        1: "каждую минуту",
-        2: "каждые 5 минут",
-        3: "каждые 10 минут"
-    }.get(mode, "неизвестный режим")
+    last_update_text = "еще не обновлялся"
+    if last_update:
+        last_update_text = last_update.strftime("%H:%M:%S")
 
     flood_status = "🟢 нет ограничений"
     if flood_until and datetime.now() < flood_until:
@@ -431,50 +438,14 @@ async def cmd_info(message: types.Message):
 
     info_text = (
         "<b>📊 Статус бота</b>\n\n"
-        f"<b>Режим работы:</b> {mode_text}\n"
-        f"<b>Ограничения:</b> {flood_status if profile_text else 'нет данных'}\n"
+        f"<b>Последнее обновление:</b> {last_update_text}\n"
+        f"<b>Ограничения:</b> {flood_status}\n"
         f"<b>Текущая надпись:</b> {profile_text or 'не установлена'}\n"
         f"<b>Населенный пункт:</b> {city_name or 'не установлен'}"
     )
 
     msg = await message.answer(info_text, parse_mode="HTML")
     message_store.add_message(message.chat.id, msg.message_id)
-
-
-@dp.message(Command("mode"))
-async def cmd_mode(message: types.Message):
-    builder = InlineKeyboardBuilder()
-    builder.row(
-        InlineKeyboardButton(text="1 минута", callback_data="mode_1"),
-        InlineKeyboardButton(text="5 минут", callback_data="mode_2"),
-        InlineKeyboardButton(text="10 минут", callback_data="mode_3")
-    )
-    msg = await message.answer("Выберите частоту обновления аватара профиля:", reply_markup=builder.as_markup())
-    message_store.add_message(message.chat.id, msg.message_id)
-
-
-@dp.callback_query(F.data.startswith("mode_"))
-async def set_mode(callback: types.CallbackQuery):
-    mode = int(callback.data.split("_")[1])
-    await shared_data.set_mode(mode)
-
-    mode_names = {
-        1: "каждую минуту",
-        2: "каждые 5 минут",
-        3: "каждые 10 минут"
-    }
-    mode_text = mode_names.get(mode, "")
-
-    try:
-        await callback.message.edit_text(
-            f"✅ Режим: обновление {mode_text}",
-            reply_markup=None
-        )
-    except Exception as e:
-        logger.error(f"Ошибка при редактировании сообщения: {e}")
-        await callback.answer(f"✅ Режим: обновление {mode_text}", show_alert=True)
-    else:
-        await callback.answer()
 
 
 def place_overlay_on_base(base: Image, overlay: Image, x: int, y: int):
@@ -644,97 +615,100 @@ def generate_icon(city: str, time_str: str, temp: str, weather: str) -> Image:
     return base
 
 
+def round_to_nearest_5_minutes(dt: datetime) -> datetime:
+    minute = dt.minute
+    rounded_minute = (minute // 5) * 5
+    if minute % 5 >= 3:
+        rounded_minute += 5
+    if rounded_minute >= 60:
+        rounded_minute = 0
+        dt += timedelta(hours=1)
+    return dt.replace(minute=rounded_minute, second=0, microsecond=0)
+
+
 async def run_telethon():
     client = TelegramClient(SESSION_NAME, TELEGRAM_API_ID, TELEGRAM_API_HASH)
     await client.start()
     logger.info("Автосмена аватара запущена")
     to_delete = []
 
-    last_processed_minute = None
     while shared_data.is_running():
         try:
             now = datetime.now()
-            current_minute = now.minute
-            mode = await shared_data.get_mode()
+            rounded_time = round_to_nearest_5_minutes(now)
+            last_update_time = await shared_data.get_last_time()
 
-            if last_processed_minute != current_minute:
-                update_needed = False
-                if mode == 1:
+            update_needed = False
+            if last_update_time is None:
+                update_needed = True
+            else:
+                # Проверяем, нужно ли обновление (если текущее округленное время больше последнего обновления)
+                if rounded_time > round_to_nearest_5_minutes(last_update_time):
                     update_needed = True
-                elif mode == 2 and (current_minute + 1) % 5 == 0:
-                    update_needed = True
-                elif mode == 3 and (current_minute + 1) % 10 == 0:
-                    update_needed = True
 
-                if update_needed:
-                    city_name, profile_text, lat, lon = await shared_data.get()
+            if update_needed:
+                city_name, profile_text, lat, lon = await shared_data.get()
 
-                    if None in (city_name, profile_text, lat, lon):
-                        logger.info(
-                            "Данные для аватара не установлены. Пропуск.")
-                    else:
-                        if len(to_delete) == 10:
-                            await client(DeletePhotosRequest(id=to_delete))
-                            to_delete.clear()
+                if None in (city_name, profile_text, lat, lon):
+                    logger.info("Данные для аватара не установлены. Пропуск.")
+                else:
+                    if len(to_delete) == 10:
+                        await client(DeletePhotosRequest(id=to_delete))
+                        to_delete.clear()
+                        logger.info("Очистка галереи профиля")
 
-                            logger.info("Очистка галереи профиля")
+                    async with aiohttp.ClientSession() as session:
+                        weather_data = await get_weather_data(session, lat, lon)
+                        if weather_data:
+                            tz_offset = timedelta(seconds=weather_data['timezone'])
+                            local_time = datetime.now(timezone(tz_offset))
+                            rounded_local_time = round_to_nearest_5_minutes(local_time)
+                            formatted_time = rounded_local_time.strftime("%H:%M")
+                            
+                            temp = int(weather_data['main']['temp'])
+                            weather_id = weather_data['weather'][0]['id']
+                            weather_cond = translate_weather(
+                                weather_id,
+                                datetime.now().time()
+                            )
 
-                        delay = random.randint(0, 120)
-                        logger.info(f"Искусствена задержка в {delay} сек.")
-                        await asyncio.sleep(delay)
-
-                        async with aiohttp.ClientSession() as session:
-                            weather_data = await get_weather_data(session, lat, lon)
-                            if weather_data:
-                                tz_offset = timedelta(
-                                    seconds=weather_data['timezone'])
-                                local_time = datetime.now(
-                                    timezone(tz_offset)).strftime("%H:%M")
-                                temp = int(weather_data['main']['temp'])
-                                weather_id = weather_data['weather'][0]['id']
-                                weather_cond = translate_weather(
-                                    weather_id,
-                                    datetime.now().time()
-                                )
-
-                                if temp > 0:
-                                    temp = f"+{temp}"
-                                elif temp < 0:
-                                    temp = f"{temp}"
-                                else:
-                                    temp = "0"
-
-                                icon = generate_icon(
-                                    re.sub(r"[ -]{2,}", " ", profile_text),
-                                    local_time,
-                                    temp,
-                                    weather_cond
-                                )
-
-                                with io.BytesIO() as buffer:
-                                    icon.save(buffer, format='PNG')
-                                    buffer.seek(0)
-
-                                    result = await client(UploadProfilePhotoRequest(file=await client.upload_file(buffer, file_name="icon.png")))
-
-                                    to_delete.append(InputPhoto(id=result.photo.id, access_hash=result.photo.access_hash,
-                                               file_reference=result.photo.file_reference))
-                                logger.info("Аватар успешно обновлен")
+                            if temp > 0:
+                                temp = f"+{temp}"
+                            elif temp < 0:
+                                temp = f"{temp}"
                             else:
-                                logger.warning("Не удалось получить данные о погоде")
+                                temp = "0"
 
-                    last_processed_minute = current_minute
+                            icon = generate_icon(
+                                re.sub(r"[ -]{2,}", " ", profile_text),
+                                formatted_time,
+                                temp,
+                                weather_cond
+                            )
 
-            await asyncio.sleep(1)
+                            with io.BytesIO() as buffer:
+                                icon.save(buffer, format='PNG')
+                                buffer.seek(0)
+
+                                result = await client(UploadProfilePhotoRequest(file=await client.upload_file(buffer, file_name="icon.png")))
+
+                                to_delete.append(InputPhoto(id=result.photo.id, access_hash=result.photo.access_hash,
+                                                            file_reference=result.photo.file_reference))
+                            logger.info(f"Аватар успешно обновлен (время: {formatted_time})")
+                            await shared_data.update_last_time() 
+                        else:
+                            logger.warning("Не удалось получить данные о погоде")
+
+            await asyncio.sleep(10)
+
         except FloodWaitError as e:
             wait_seconds = e.seconds
-            logger.warning(
-                f"Ожидание {wait_seconds} секунд из-за ограничений Telegram")
+            logger.warning(f"Ожидание {wait_seconds} секунд из-за ограничений Telegram")
             await shared_data.set_flood_wait(wait_seconds)
             await asyncio.sleep(wait_seconds + 1)
         except Exception as e:
             logger.error(f"Ошибка в Telethon: {e}", exc_info=True)
-            await asyncio.sleep(60)
+            await asyncio.sleep(10)
 
     await client.disconnect()
     logger.info("Telethon клиент остановлен")
